@@ -1,64 +1,101 @@
-// Pure frame analysis and timing logic. Coordinates are normalized to image height/width.
-export function createDetectionWorkspace() {return {mask:null,seen:null,queue:null};}
-export function detectRed(data, width, height, sensitivity = 50, previous = null, workspace = createDetectionWorkspace()) {
-  const size=width*height;
-  if(workspace.mask?.length!==size){workspace.mask=new Uint8Array(size);workspace.seen=new Uint8Array(size);workspace.queue=new Uint32Array(size);}
-  const {mask,seen,queue}=workspace;mask.fill(0);seen.fill(0);
-  const sat = .65 - sensitivity * .004, value = .30 - sensitivity * .0015;
-  for (let p = 0; p < mask.length; p++) {
-    const i = p * 4, r = data[i] / 255, g = data[i+1] / 255, b = data[i+2] / 255;
-    const max = Math.max(r,g,b), min = Math.min(r,g,b), d = max-min;
-    let h = d === 0 ? 180 : max === r ? 60 * (((g-b)/d+6)%6) : max === g ? 60*((b-r)/d+2) : 60*((r-g)/d+4);
-    if ((h < 12 + sensitivity*.16 || h > 348-sensitivity*.16) && d/(max||1) > sat && max > value) mask[p]=1;
+// Background and tracking buffers contain only reduced-resolution local pixels.
+export class MotionDetector {
+  constructor(){this.reset();}
+  reset(){this.ready=false;this.started=null;this.samples=0;this.width=0;this.height=0;}
+  allocate(w,h){
+    if(this.width===w&&this.height===h)return;
+    this.reset();this.width=w;this.height=h;const n=w*h;
+    this.background=new Float32Array(n*3);this.previous=new Uint8Array(n*3);
+    this.mask=new Uint8Array(n);this.clean=new Uint8Array(n);this.seen=new Uint8Array(n);this.queue=new Uint32Array(n);
+    this.hist=new Uint32Array(511*3);
   }
-  const blobs=[];
-  for(let p=0;p<mask.length;p++) {
-    if(!mask[p] || seen[p]) continue;
-    queue[0]=p;let count=1; seen[p]=1; let sx=0,sy=0;
-    for(let q=0;q<count;q++) {
-      const n=queue[q],x=n%width,y=Math.floor(n/width); sx+=x; sy+=y;
-      // No per-pixel neighbor arrays or per-component growing queues.
-      if(x>0 && mask[n-1]&&!seen[n-1]){seen[n-1]=1;queue[count++]=n-1;}
-      if(x<width-1 && mask[n+1]&&!seen[n+1]){seen[n+1]=1;queue[count++]=n+1;}
-      if(y>0 && mask[n-width]&&!seen[n-width]){seen[n-width]=1;queue[count++]=n-width;}
-      if(y<height-1 && mask[n+width]&&!seen[n+width]){seen[n+width]=1;queue[count++]=n+width;}
+  process(data,w,h,t,sensitivity=50){
+    this.allocate(w,h);const n=w*h,threshold=42-sensitivity*.28;
+    if(!this.ready){
+      let changed=0;
+      for(let p=0;p<n;p++){let d=0;for(let c=0;c<3;c++){const value=data[p*4+c];d+=Math.abs(value-this.previous[p*3+c]);this.previous[p*3+c]=value;}if(d>48)changed++;}
+      if(this.started===null || (this.samples && changed/n>.005)){this.started=t;this.samples=0;}
+      this.samples++;
+      for(let p=0;p<n;p++)for(let c=0;c<3;c++){const i=p*3+c;this.background[i]+=(data[p*4+c]-this.background[i])/this.samples;}
+      this.ready=t-this.started>=800&&this.samples>=10;
+      return {ready:this.ready,blobs:[],motion:false,reason:this.ready?'背景取得完了':'背景取得中：画面を静止してください'};
     }
-    if(count>=Math.max(5,size*.00006) && count<size*.12) blobs.push({x:sx/count/width,y:sy/count/height,area:count});
+    // Sampled channel-wise median compensates a global illumination shift.
+    this.hist.fill(0);let count=0;
+    for(let p=0;p<n;p+=8){for(let c=0;c<3;c++){const d=Math.round(data[p*4+c]-this.background[p*3+c]);this.hist[c*511+d+255]++;}count++;}
+    const offsets=[];
+    for(let c=0;c<3;c++){let sum=0;for(let i=0;i<511;i++){sum+=this.hist[c*511+i];if(sum>=count/2){offsets[c]=i-255;break;}}}
+    this.mask.fill(0);this.clean.fill(0);this.seen.fill(0);
+    let changed=0;
+    for(let p=0;p<n;p++){
+      let diff=0;for(let c=0;c<3;c++)diff=Math.max(diff,Math.abs(data[p*4+c]-this.background[p*3+c]-offsets[c]));
+      if(diff>threshold){this.mask[p]=1;changed++;}
+    }
+    if(changed/n>.16 || offsets.some(v=>Math.abs(v)>55))return {ready:true,blobs:[],motion:true,invalid:true,reason:'照明変化／カメラ移動が大きすぎます。背景を再取得してください'};
+    for(let y=1;y<h-1;y++)for(let x=1;x<w-1;x++){const p=y*w+x;if(this.mask[p]&&(this.mask[p-1]+this.mask[p+1]+this.mask[p-w]+this.mask[p+w]>=2))this.clean[p]=1;}
+    const blobs=[];let motionPixels=0;
+    for(let p=0;p<n;p++){
+      if(!this.clean[p]||this.seen[p])continue;
+      this.queue[0]=p;this.seen[p]=1;let length=1,sx=0,sy=0,x0=w,y0=h,x1=0,y1=0;
+      for(let q=0;q<length;q++){
+        const i=this.queue[q],x=i%w,y=Math.floor(i/w);sx+=x;sy+=y;x0=Math.min(x0,x);x1=Math.max(x1,x);y0=Math.min(y0,y);y1=Math.max(y1,y);
+        if(x>0&&this.clean[i-1]&&!this.seen[i-1]){this.seen[i-1]=1;this.queue[length++]=i-1;}
+        if(x<w-1&&this.clean[i+1]&&!this.seen[i+1]){this.seen[i+1]=1;this.queue[length++]=i+1;}
+        if(y>0&&this.clean[i-w]&&!this.seen[i-w]){this.seen[i-w]=1;this.queue[length++]=i-w;}
+        if(y<h-1&&this.clean[i+w]&&!this.seen[i+w]){this.seen[i+w]=1;this.queue[length++]=i+w;}
+      }
+      if(length>=Math.max(9,n*.00015)){
+        motionPixels+=length;
+        if(length<n*.08)blobs.push({x:sx/length/w,y:sy/length/h,area:length,x0:x0/w,y0:y0/h,x1:(x1+1)/w,y1:(y1+1)/h});
+      }
+    }
+    return {ready:true,blobs,motion:motionPixels>0,invalid:motionPixels>0&&!blobs.length,reason:motionPixels&&!blobs.length?'物体が大きすぎます':''};
   }
-  if(!blobs.length) return {point:null,reason:'赤色領域なし／面積が範囲外'};
-  blobs.sort((a,b)=> previous ? Math.hypot(a.x-previous.x,a.y-previous.y)-Math.hypot(b.x-previous.x,b.y-previous.y) : b.area-a.area);
-  const point=blobs[0];
-  if(previous && Math.hypot(point.x-previous.x,point.y-previous.y)>.22) return {point:null,reason:'位置の飛び（追跡対象が不確実）'};
-  const ambiguous=blobs.some((b,i)=>i>0 && b.area>point.area*.6 && (!previous || Math.hypot(b.x-previous.x,b.y-previous.y)<.22));
-  return {point,reason:ambiguous?'複数の赤色候補':'',ambiguous};
 }
-export class FallTimer {
-  constructor(config={}) {this.config={floor:.85,startSpeed:.10,startMs:100,stopSpeed:.045,settleMs:450,maxMs:15000,...config};this.reset();}
-  reset(){this.state='待機中';this.last=null;this.run=null;this.stop=null;this.start=null;this.end=null;this.flags=new Set();this.result=null;this.speed=0;}
-  flag(reason){if(this.start!==null)this.flags.add(reason);}
-  finish(t,reason){this.end=t;if(reason)this.flags.add(reason);this.state='計測完了';this.result={seconds:Math.max(0,(t-this.start)/1000),start:this.start,end:t,flags:[...this.flags],status:this.flags.size?'確認待ち':'確定'};return this.result;}
-  update(point,t,uncertain=false){
-    if(this.result)return null;
-    if(this.start!==null && t-this.start>this.config.maxMs)return this.finish(this.last?.t??t,'時間上限／着地未確認');
-    if(!point){this.flag('マーカー消失');this.run=null;this.stop=null;if(this.start===null)this.state='待機中';return null;}
-    if(uncertain)this.flag('複数の赤色候補');
-    if(!this.last){this.last={...point,t};return null;}
-    const prev=this.last,dt=t-prev.t; if(dt<=0)return null;
-    this.speed=(point.y-prev.y)/(dt/1000);this.last={...point,t};
-    if(dt>200){this.flag('フレーム間隔が200ms超');this.run=null;this.stop=null;return null;}
-    if(this.start===null){
-      if(this.speed>this.config.startSpeed && point.y<this.config.floor-.06){
-        if(!this.run)this.run={t:prev.t,y:prev.y};this.state='落下検出';
-        if(t-this.run.t>=this.config.startMs){this.start=this.run.t;this.state='計測中';if(uncertain)this.flag('複数の赤色候補');}
-      }else{this.run=null;this.state='待機中';}
+export class PassageTracker {
+  constructor(config={}){this.config={upper:.25,lower:.75,quietMs:800,maxMs:10000,maxGap:180,...config};this.reset();}
+  reset(){this.state='静止待ち';this.track=null;this.start=null;this.end=null;this.reason='';this.quiet=null;this.locked=false;this.armed=false;this.result=null;this.speed=0;}
+  fail(reason){if(this.locked)return null;this.reason=reason;this.state='測定失敗';this.locked=true;this.armed=false;this.quiet=null;this.track=null;return {type:'failure',reason};}
+  update(d,t){
+    if(!d.ready){this.state='背景取得中';return null;}
+    if(this.locked||!this.armed){
+      if(!this.locked)this.state='静止待ち';
+      if(d.motion||d.invalid)this.quiet=null;else if(this.quiet===null)this.quiet=t;
+      if(this.quiet!==null&&t-this.quiet>=this.config.quietMs){this.locked=false;this.armed=true;this.track=null;this.start=null;this.end=null;this.state='待機中';this.result=null;this.speed=0;}
       return null;
     }
-    if(point.y>=this.config.floor-.06 && Math.abs(this.speed)<=this.config.stopSpeed){
-      if(!this.stop)this.stop={t:prev.t,x:prev.x,y:prev.y};
-      if(Math.hypot(point.x-this.stop.x,point.y-this.stop.y)>.018)this.stop={t:prev.t,x:prev.x,y:prev.y};
-      this.state='着地判定中';
-      if(t-this.stop.t>=this.config.settleMs)return this.finish(this.stop.t);
-    }else{this.stop=null;this.state='計測中';}
+    if(d.invalid)return this.fail(d.reason||'背景変動');
+    if(!this.track){
+      if(d.blobs.length!==1)return null;
+      const p=d.blobs[0];
+      // Only acquire an object entering from the top, before the upper line.
+      if(p.y0>.12||p.y>=this.config.upper-.025)return null;
+      this.track={...p,t,firstY:p.y,frames:1,lastAdvance:t};this.state='追跡中';this.reason='';return null;
+    }
+    const prev=this.track,dt=t-prev.t;
+    if(dt<=0)return null;
+    if(dt>this.config.maxGap)return this.fail('フレーム間隔が大きすぎます');
+    if(d.blobs.length!==1)return this.fail(d.blobs.length?'複数物体で対象が不確実':'追跡対象を見失いました');
+    const p=d.blobs[0],distance=Math.hypot(p.x-prev.x,p.y-prev.y),ratio=p.area/prev.area;
+    const predictedY=prev.y+Math.max(0,this.speed)*dt/1000;
+    if(distance>.16 || Math.abs(p.x-prev.x)>.10 || Math.abs(p.y-predictedY)>.10 || ratio<.4||ratio>(prev.y0<=.015&&p.y0<=.04?8:2.5))return this.fail('位置・大きさが不連続です');
+    if(p.y<prev.y-.018)return this.fail('上向きの移動を検出しました');
+    this.speed=(p.y-prev.y)/(dt/1000);
+    const advanced=p.y>prev.y+.002;
+    this.track={...p,t,firstY:prev.firstY,frames:prev.frames+1,lastAdvance:advanced?t:prev.lastAdvance};
+    if(t-this.track.lastAdvance>600)return this.fail('下降の連続性を確認できません');
+    const crossing=line=>prev.t+(line-prev.y)/(p.y-prev.y)*dt;
+    if(this.start===null&&prev.y<this.config.upper&&p.y>=this.config.upper){
+      if(this.track.frames<3||p.y-prev.firstY<.025||this.speed<=.02)return this.fail('上側通過前の追跡が不足しています');
+      this.start=crossing(this.config.upper);
+    }
+    if(this.start!==null&&t-this.start>this.config.maxMs)return this.fail('下側ラインの通過時間を超過しました');
+    if(this.start!==null&&prev.y<this.config.lower&&p.y>=this.config.lower){
+      this.end=crossing(this.config.lower);const seconds=(this.end-this.start)/1000;
+      if(seconds<=0)return this.fail('通過順序が不正です');
+      this.result={type:'success',seconds,start:this.start,end:this.end,flags:[],status:'確定',method:'background-lines-v1'};
+      this.state='計測完了';this.locked=true;this.armed=false;this.quiet=null;return this.result;
+    }
     return null;
   }
 }

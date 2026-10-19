@@ -27,20 +27,8 @@ const expectedOptions = { method:'GET', mode:'no-cors', cache:'no-store', creden
           }
           return original.call(this, url, options);
         };
-        navigator.mediaDevices.getUserMedia = async () => {
-          const c = document.createElement('canvas'); c.width=640; c.height=480;
-          const cx=c.getContext('2d'), start=performance.now();
-          const draw=()=>{
-            const elapsed=performance.now()-start;
-            const y=elapsed<800 ? .2 : Math.min(.8,.2+(elapsed-800)*.0006);
-            cx.fillStyle='#222';cx.fillRect(0,0,640,480);
-            cx.fillStyle='#ef2020';cx.fillRect(310,y*480-6,20,12);
-          };
-          draw();const media=c.captureStream(30), track=media.getVideoTracks()[0];
-          const interval=setInterval(()=>{if(track.readyState==='ended')clearInterval(interval);else draw();},33);
-          return media;
-        };
       }, outcome);
+      await require('./motion-fixture.cjs').install(page);
       await page.goto(process.env.TEST_URL || 'http://127.0.0.1:8765/');
       const checkCalls = async () => assert.deepEqual(await page.evaluate(()=>window.counterCalls), outcome === 'missing-fetch' ? [] : [{url:endpoint, options:expectedOptions}]);
       await checkCalls();
@@ -51,16 +39,17 @@ const expectedOptions = { method:'GET', mode:'no-cors', cache:'no-store', creden
       await page.locator('[name=experiment]').fill('カウンター検証');
       await page.getByRole('button',{name:'01 計測'}).click();
       assert.equal(await page.locator('#message').textContent(),before);
-      await page.locator('#startCamera').click();
+      await require('./motion-fixture.cjs').prepare(page);
+      await page.evaluate(()=>runDrop());
       await page.waitForFunction(()=>JSON.parse(localStorage.getItem('copter.records')||'[]').length===1, {}, {timeout:12000});
-      await page.locator('#next').click();
+
       await page.locator('#stopCamera').click();
       await page.getByRole('button',{name:'03 測定結果'}).click();
-      await page.getByRole('button',{name:'確認して確定'}).click();
+
       const download=page.waitForEvent('download'); await page.locator('#export').click(); await download;
       await checkCalls();
       assert.equal(await page.locator('#storageMessage').textContent(),'');
-      assert.equal(await page.locator('#resultNotice').textContent(),'');
+
       const networkCount=['success','network-failure'].includes(outcome) ? 1 : 0;
       assert.equal(requests.length,networkCount);
       await page.reload();await checkCalls();
