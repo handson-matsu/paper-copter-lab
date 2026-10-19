@@ -1,0 +1,16 @@
+const assert=require('node:assert/strict');const {chromium}=require(process.env.PLAYWRIGHT_MODULE||'playwright');const {install,prepare}=require('./motion-fixture.cjs');
+(async()=>{const browser=await chromium.launch({headless:true,executablePath:process.env.CHROME_PATH||undefined});try{
+ const page=await browser.newPage({viewport:{width:1024,height:900},hasTouch:true}),errors=[];page.on('pageerror',e=>errors.push(e.message));await page.route('https://script.google.com/**',r=>r.abort());await install(page,{noise:true});await page.goto(process.env.TEST_URL||'http://localhost:8765/');await page.locator('#debugToggle').check();await prepare(page);
+ assert.equal(await page.locator('#sensitivity').count(),0);assert.match(await page.locator('#sensitivityValue').textContent(),/自動/);
+ // A: unchanged wall, grain, auto exposure and gate-wide synchronous flicker.
+ await page.waitForTimeout(1500);assert.equal(await page.evaluate(()=>JSON.parse(localStorage.getItem('copter.records')||'[]').length),0);assert.equal(await page.locator('#state').textContent(),'待機中');await page.evaluate(()=>window.gateFlash=true);await page.waitForTimeout(1500);assert.equal(await page.evaluate(()=>JSON.parse(localStorage.getItem('copter.records')||'[]').length),0);assert.equal(await page.locator('#state').textContent(),'待機中');console.log('PASS A: noisy white wall + exposure changes + synchronous gate flicker, no starts or records at automatic sensitivity');
+ await page.evaluate(()=>window.gateFlash=false);await page.waitForTimeout(100);
+ // B: exact same model and sensitivity, small 6x6 object moving fast.
+ for(const [duration,n]of [[.2,1],[.5,2],[.8,3]]){
+   await page.evaluate(duration=>runDrop('success','#808080',duration),duration);
+   await page.waitForFunction(n=>JSON.parse(localStorage.getItem('copter.records')||'[]').length===n,n,{timeout:7000});
+   const r=await page.evaluate(()=>JSON.parse(localStorage.getItem('copter.records'))[0]);assert.ok(Math.abs(r.seconds-duration)<.12,JSON.stringify(r));await page.evaluate(()=>clearDrop());await page.waitForTimeout(650);
+ }console.log('PASS B: same background/model/automatic sensitivity, 6x6 object at 0.2/0.5/0.8 seconds measured');
+ await page.locator('summary').click();await page.getByRole('button',{name:'感度を上げる',exact:true}).tap();assert.match(await page.locator('#sensitivityValue').textContent(),/\+1/);await page.waitForFunction(()=>document.getElementById('debug').textContent.includes('微調整: 1'));await page.getByRole('button',{name:'感度を下げる',exact:true}).tap();assert.match(await page.locator('#sensitivityValue').textContent(),/補正 0/);await page.waitForFunction(()=>document.getElementById('debug').textContent.includes('微調整: 0'));
+ for(let i=0;i<5;i++)await page.getByRole('button',{name:'感度を下げる',exact:true}).tap();assert.ok(await page.locator('#sensitivityMinus').isDisabled());assert.match(await page.locator('#debug').textContent(),/ゲート基準/);await page.screenshot({path:'/private/tmp/copter-noise-gates.png',fullPage:true});assert.deepEqual(errors,[]);console.log('PASS: touch +/- controls update exactly once, bounds and next-frame application, collapsible diagnostics');
+}finally{await browser.close();}})().catch(e=>{console.error(e);process.exit(1);});

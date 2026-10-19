@@ -1,4 +1,4 @@
-import {MotionDetector,BandTimer,bandActivity,csvCell} from './tracker.js';
+import {MotionDetector,BandTimer,csvCell} from './tracker.js';
 import {containRect,imagePoint,analysisSize,cameraError,inspectFrame} from './camera-utils.js';
 const $=id=>document.getElementById(id),video=$('video'),overlay=$('overlay'),ctx=overlay.getContext('2d');
 const analysis=document.createElement('canvas'),ax=analysis.getContext('2d',{willReadFrequently:true});
@@ -6,6 +6,7 @@ const differenceCanvas=$('differenceCanvas'),differenceContext=differenceCanvas.
 const detector=new MotionDetector();let tracker=new BandTimer();
 let stream=null,callback=null,usingVideoFrames=false,sourceWidth=0,sourceHeight=0,lastFrame=0,lastMediaTime=-1,generation=0;
 let frameReads=0,inputInfo=null,lastInputHash=null,inputChanges=0;
+let adjustment=0,startAdjustment=0;
 let backgroundRequested=false,upper=.25,lower=.75,dragLine=null,snapshot={},records=[],savedConditions={},fps=0;
 const labels={experiment:'実験名',group:'グループ名',wingLength:'羽根の長さ(mm)',wingWidth:'羽根の幅(mm)',bodyLength:'胴体の長さ(mm)',weights:'重りの数',height:'落下高さ(cm)',memo:'メモ'};
 function warn(text){$('message').textContent=text;}
@@ -45,7 +46,14 @@ function changedSettings(){
 function setLine(which,y){if(which==='upper')upper=Math.max(.10,Math.min(lower-.15,.65,y));else lower=Math.min(.90,Math.max(upper+.15,.30,y));changedSettings();}
 $('upperLine').oninput=e=>setLine('upper',Number(e.target.value)/100);
 $('lowerLine').oninput=e=>setLine('lower',Number(e.target.value)/100);
-$('sensitivity').oninput=()=>{$('sensitivityValue').textContent=$('sensitivity').value;changedSettings();};
+function adjustSensitivity(delta){
+  adjustment=Math.max(-5,Math.min(5,adjustment+delta));
+  $('sensitivityValue').textContent=adjustment===0?'自動（補正 0）':`自動＋微調整 ${adjustment>0?'+':''}${adjustment}`;
+  $('sensitivityMinus').disabled=adjustment<=-5;$('sensitivityPlus').disabled=adjustment>=5;
+  tracker.config.adjustment=adjustment;
+}
+$('sensitivityMinus').onclick=()=>adjustSensitivity(-1);
+$('sensitivityPlus').onclick=()=>adjustSensitivity(1);
 $('debugToggle').onchange=()=>{$('debug').hidden=!$('debugToggle').checked;$('diagnostics').hidden=!$('debugToggle').checked;};
 function videoRect(){return containRect(overlay.width,overlay.height,video.videoWidth,video.videoHeight);}
 function pointerPoint(e){const b=overlay.getBoundingClientRect();return imagePoint(videoRect(),(e.clientX-b.left)*overlay.width/b.width,(e.clientY-b.top)*overlay.height/b.height);}
@@ -60,7 +68,7 @@ overlay.onpointerup=overlay.onpointercancel=()=>{dragLine=null;};
 function resize(){const b=overlay.getBoundingClientRect();if(!b.width||!b.height)return;const scale=Math.min(devicePixelRatio||1,2,1920/Math.max(b.width,b.height));const w=Math.round(b.width*scale),h=Math.round(b.height*scale);if(overlay.width!==w||overlay.height!==h){overlay.width=w;overlay.height=h;}}
 new ResizeObserver(resize).observe($('stage'));
 function saveResult(result){
-  const record={...result,id:crypto.randomUUID(),date:new Date().toISOString(),conditions:{...snapshot},config:{...tracker.config,sensitivity:Number($('sensitivity').value),backgroundModel:'median-1500ms-idle-adaptive',backgroundSamples:detector.samples}};
+  const record={...result,id:crypto.randomUUID(),date:new Date().toISOString(),conditions:{...snapshot},config:{...tracker.config,sensitivityAdjustment:startAdjustment,endSensitivityAdjustment:adjustment,backgroundModel:'median-mad-gate-noise-v2',backgroundSamples:detector.samples,gateNoise:detector.gateCache?.baseline}};
   records.unshift(record);const ok=store('copter.records',records);renderRecords();
   $('time').textContent=result.seconds.toFixed(3);$('milliseconds').textContent=result.milliseconds.toFixed(1)+' ms';$('resultNotice').textContent=ok?'簡易帯通過時間を自動保存しました。':'保存失敗：CSVを書き出してください。';
 }
@@ -102,24 +110,24 @@ function frame(t,token){
       if(backgroundRequested){
         ax.drawImage(video,0,0,w,h);const pixels=ax.getImageData(0,0,w,h).data;frameReads++;
         if($('debugToggle').checked){inputInfo=inspectFrame(pixels);if(lastInputHash!==null&&inputInfo.hash!==lastInputHash)inputChanges++;lastInputHash=inputInfo.hash;}
-        d=detector.process(pixels,w,h,t,Number($('sensitivity').value),tracker.start===null&&!tracker.locked);
+        d=detector.process(pixels,w,h,t,adjustment,tracker.start===null&&!tracker.locked);
       }
       $('backgroundStatus').textContent=!backgroundRequested?'背景：未取得':detector.ready?`背景：取得済み（${detector.samples}フレーム中央値）`:`背景：取得中 ${Math.round((d.progress||0)*100)}%`;
-      if(detector.ready){d.bands=bandActivity(detector.mask,w,h,tracker.config);}
+      if(detector.ready){d.bands=detector.gates({...tracker.config,adjustment});}
       const priorState=tracker.state,event=backgroundRequested?tracker.update(d,t):null;
       updateBandStatus(d,t);
       if(priorState!==tracker.state){
         const messages={'待機中':'準備完了。紙コプターを撮影範囲より上から落としてください。','計測中':'上側を検出しました。下側判定帯の反応待ちです。','静止待ち':'画面が静止するのを待っています。','背景取得中':'背景を約1.5秒撮影中。多少の動きがあっても取得します。','計測完了':'計測完了。600ms後に次の測定を受け付けます。','測定失敗':tracker.reason+'。数値は保存しません。画面内を空にしてください。'};
         if(messages[tracker.state])warn(messages[tracker.state]);
       }
-      if(event?.type==='start'){snapshot=conditions();$('time').textContent='0.000';$('resultNotice').textContent='上側を検出しました';}
+      if(event?.type==='start'){startAdjustment=adjustment;snapshot=conditions();$('time').textContent='0.000';$('resultNotice').textContent='上側を検出しました';}
       if(event?.type==='success')saveResult(event);
       if(event?.type==='failure'){$('time').textContent='—';$('milliseconds').textContent='— ms';$('resultNotice').textContent=event.reason+'。数値は保存しません。';}
       $('state').textContent=backgroundRequested?tracker.state:'背景未取得';
       $('detection').textContent=tracker.reason||d.reason||'背景を取得してください';
       if(tracker.start!==null&&!tracker.locked){$('time').textContent=((t-tracker.start)/1000).toFixed(3);$('milliseconds').textContent=(t-tracker.start).toFixed(1)+' ms';}
       draw(d);
-      if($('debugToggle').checked){drawDiagnostics(d,w,h);$('debug').textContent=`背景: ${detector.ready?'取得済み':'未取得'} / 動体反応: ${(d.regions||d.blobs).length} / 枠用候補（計測不使用）: ${d.blobs.length}\nCanvas取得: ${frameReads}回 / 入力変化: ${inputChanges}回 / video時刻: ${video.currentTime.toFixed(3)}s\n入力: hash=${inputInfo?.hash||'—'} RGB=${inputInfo?.min??'—'}..${inputInfo?.max??'—'} 平均=${inputInfo?.mean.toFixed(1)??'—'} α=${inputInfo?.alpha.toFixed(0)??'—'}\n差分: 補正前最大=${d.stats?.rawMaxDifference.toFixed(1)??'—'} 補正後最大=${d.stats?.maxDifference.toFixed(1)??'—'} 閾値=${d.stats?.threshold??'—'}\n変化画素: ${d.stats?.changedPixels??'—'} / 枠用小面積除外=${d.stats?.smallRejected??'—'} 枠用大面積除外=${d.stats?.largeRejected??'—'}\n背景更新: ${d.stats?.backgroundUpdating?'待機中の非前景画素のみ':'停止'} / 解析時刻: ${t.toFixed(1)}ms\n帯内変化画素: 上=${d.bands?.upper.pixels??0} / 下=${d.bands?.lower.pixels??0} / 発火閾値=${tracker.config.minPixels}\n物体追跡・面積上限・複数候補制限: 計測には使用しません\n上側通過: ${tracker.start??'—'} ms / 下側通過: ${tracker.end??'—'} ms\n処理: ${fps.toFixed(1)} fps / ${(performance.now()-begin).toFixed(2)} ms / ${w}×${h}\n理由: ${tracker.reason||d.reason||'なし'}`;}
+      if($('debugToggle').checked){drawDiagnostics(d,w,h);$('debug').textContent=`背景: ${detector.ready?'取得済み':'未取得'} / 動体反応: ${(d.regions||d.blobs).length} / 枠用候補（計測不使用）: ${d.blobs.length}\nCanvas取得: ${frameReads}回 / 入力変化: ${inputChanges}回 / video時刻: ${video.currentTime.toFixed(3)}s\n入力: hash=${inputInfo?.hash||'—'} RGB=${inputInfo?.min??'—'}..${inputInfo?.max??'—'} 平均=${inputInfo?.mean.toFixed(1)??'—'} α=${inputInfo?.alpha.toFixed(0)??'—'}\n差分: 補正前最大=${d.stats?.rawMaxDifference.toFixed(1)??'—'} 補正後最大=${d.stats?.maxDifference.toFixed(1)??'—'} 閾値下限=${d.stats?.threshold.toFixed(2)??'—'}\n変化画素: ${d.stats?.changedPixels??'—'} / 枠用小面積除外=${d.stats?.smallRejected??'—'} 枠用大面積除外=${d.stats?.largeRejected??'—'}\n背景更新: ${d.stats?.backgroundUpdating?'待機中の非前景画素のみ':'停止'} / 解析時刻: ${t.toFixed(1)}ms\n帯内変化画素: 上=${d.bands?.upper.pixels??0} / 下=${d.bands?.lower.pixels??0} / 連結画素: 上=${d.bands?.upper.cluster??0} 下=${d.bands?.lower.cluster??0}\nゲート基準: 上=${d.bands?.upper.limit??'—'}（中央値${d.bands?.upper.noise.median??'—'} MAD${d.bands?.upper.noise.mad??'—'}） 下=${d.bands?.lower.limit??'—'}（中央値${d.bands?.lower.noise.median??'—'} MAD${d.bands?.lower.noise.mad??'—'}）\n画素ノイズσ中央値: 上=${d.bands?.upper.noise.pixelSigma?.toFixed(2)??'—'} 下=${d.bands?.lower.noise.pixelSigma?.toFixed(2)??'—'}\nゲート露出変動中央値: 上=${d.bands?.upper.exposureMedian??'—'} 下=${d.bands?.lower.exposureMedian??'—'}\n上側理由: ${d.bands?.upper.reason??'取得中'}\n下側理由: ${d.bands?.lower.reason??'取得中'}\n自動ノイズ感度の微調整: ${adjustment}\n物体追跡・面積上限・複数候補制限: 計測には使用しません\n上側通過: ${tracker.start??'—'} ms / 下側通過: ${tracker.end??'—'} ms\n処理: ${fps.toFixed(1)} fps / ${(performance.now()-begin).toFixed(2)} ms / ${w}×${h}\n理由: ${tracker.reason||d.reason||'なし'}`;}
     }
   }catch(e){stopCamera(`解析を継続できません（${e.name}）。再起動してください。`);return;}
   schedule(token);
