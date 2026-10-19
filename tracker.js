@@ -81,52 +81,39 @@ export class MotionDetector {
       stats:{threshold,rawMaxDifference,maxDifference,changedPixels:changed,changedRatio:changed/n,components,smallRejected,largeRejected,offsets,backgroundUpdating:adapt&&changed/n<=.16&&offsets.every(v=>Math.abs(v)<=80)}};
   }
 }
-export class PassageTracker {
-  constructor(config={}){this.config={upper:.25,lower:.75,quietMs:800,maxMs:10000,maxGap:180,...config};this.reset();}
-  reset(){this.state='背景取得待ち';this.track=null;this.start=null;this.end=null;this.reason='';this.quiet=null;this.locked=false;this.armed=false;this.result=null;this.speed=0;}
-  fail(reason){if(this.locked)return null;this.reason=reason;this.state='測定失敗';this.locked=true;this.armed=false;this.quiet=null;this.track=null;return {type:'failure',reason};}
+// Bands read the raw threshold mask, before component/area/shape filtering.
+export function bandActivity(mask,width,height,config={}){
+  const {upper=.25,lower=.75,bandHeight=.12,minPixels=3}=config;
+  const read=center=>{
+    const top=Math.max(0,Math.floor((center-bandHeight/2)*height));
+    const bottom=Math.min(height,Math.ceil((center+bandHeight/2)*height));let pixels=0;
+    for(let y=top;y<bottom;y++)for(let x=0;x<width;x++)pixels+=mask[y*width+x]?1:0;
+    return {active:pixels>=minPixels,pixels,top:top/height,bottom:bottom/height};
+  };
+  return {upper:read(upper),lower:read(lower)};
+}
+export class BandTimer {
+  constructor(config={}){this.config={upper:.25,lower:.75,bandHeight:.12,minPixels:3,cooldownMs:600,maxMs:5000,...config};this.reset();}
+  reset(){this.state='背景取得待ち';this.start=null;this.end=null;this.reason='';this.locked=false;this.until=0;this.lastTime=-Infinity;this.result=null;this.upperHitAt=null;this.lowerHitAt=null;}
+  fail(reason,t=this.lastTime){this.reason=reason;this.state='測定失敗';this.locked=true;this.until=t+this.config.cooldownMs;return {type:'failure',reason};}
   update(d,t){
+    if(!Number.isFinite(t)||t<=this.lastTime)return null;this.lastTime=t;
     if(!d.ready){this.state='背景取得中';return null;}
-    if(!this.armed&&!this.locked){this.armed=true;this.state='待機中';return null;}
-    if(this.locked){
-      if(!this.locked)this.state='静止待ち';
-      if(d.motion||d.invalid)this.quiet=null;else if(this.quiet===null)this.quiet=t;
-      if(this.quiet!==null&&t-this.quiet>=this.config.quietMs){this.locked=false;this.armed=true;this.track=null;this.start=null;this.end=null;this.state='待機中';this.result=null;this.speed=0;}
-      return null;
+    if(this.locked){if(t<this.until)return null;this.locked=false;this.start=null;this.end=null;this.result=null;this.reason='';this.state='待機中';}
+    const upper=!!d.bands?.upper.active,lower=!!d.bands?.lower.active;
+    if(this.start===null){
+      this.state='待機中';
+      if(!upper){this.reason=lower?'下側のみ反応：上側の反応待ち':'上側判定帯の反応待ち';return null;}
+      this.start=t;this.upperHitAt=t;this.lowerHitAt=null;this.state='計測中';this.reason=lower?'両帯が同じフレームで反応：次のフレームの下側反応待ち':'上側検出：下側判定帯の反応待ち';
+      return {type:'start',start:t};
     }
-    if(d.invalid){if(this.track)return this.fail(d.reason||'背景変動');this.reason=d.reason||'背景変動';this.state='待機中';return null;}
-    if(!this.track){
-      if(d.blobs.length!==1)return null;
-      const p=d.blobs[0];
-      // Only acquire an object entering from the top, before the upper line.
-      if(p.y0>.12||p.y>=this.config.upper-.025)return null;
-      this.track={...p,t,firstY:p.y,frames:1,lastAdvance:t};this.state='追跡中';this.reason='';return null;
+    if(t-this.start>this.config.maxMs)return this.fail('上側検出後5秒以内に下側判定帯を検出できませんでした',t);
+    if(lower){
+      this.end=t;this.lowerHitAt=t;this.state='計測完了';this.locked=true;this.until=t+this.config.cooldownMs;this.reason='上下検出完了：600ms後に自動受付';
+      this.result={type:'success',seconds:(this.end-this.start)/1000,milliseconds:this.end-this.start,start:this.start,end:this.end,flags:['簡易帯検出：同一物体・方向は未確認'],status:'簡易計測',method:'background-bands-v1'};
+      return this.result;
     }
-    const prev=this.track,dt=t-prev.t;
-    if(dt<=0)return null;
-    if(dt>this.config.maxGap)return this.fail('フレーム間隔が大きすぎます');
-    if(d.blobs.length!==1)return this.fail(d.blobs.length?'複数物体で対象が不確実':'追跡対象を見失いました');
-    const p=d.blobs[0],distance=Math.hypot(p.x-prev.x,p.y-prev.y),ratio=p.area/prev.area;
-    const predictedY=prev.y+Math.max(0,this.speed)*dt/1000;
-    if(distance>.16 || Math.abs(p.x-prev.x)>.10 || Math.abs(p.y-predictedY)>.10 || ratio<.4||ratio>(prev.y0<=.015&&p.y0<=.04?8:2.5))return this.fail('位置・大きさが不連続です');
-    if(p.y<prev.y-.018)return this.fail('上向きの移動を検出しました');
-    this.speed=(p.y-prev.y)/(dt/1000);
-    const advanced=p.y>prev.y+.002;
-    this.track={...p,t,firstY:prev.firstY,frames:prev.frames+1,lastAdvance:advanced?t:prev.lastAdvance};
-    if(t-this.track.lastAdvance>600)return this.fail('下降の連続性を確認できません');
-    const crossing=line=>prev.t+(line-prev.y)/(p.y-prev.y)*dt;
-    if(this.start===null&&prev.y<this.config.upper&&p.y>=this.config.upper){
-      if(this.track.frames<3||p.y-prev.firstY<.025||this.speed<=.02)return this.fail('上側通過前の追跡が不足しています');
-      this.start=crossing(this.config.upper);
-    }
-    if(this.start!==null&&t-this.start>this.config.maxMs)return this.fail('下側ラインの通過時間を超過しました');
-    if(this.start!==null&&prev.y<this.config.lower&&p.y>=this.config.lower){
-      this.end=crossing(this.config.lower);const seconds=(this.end-this.start)/1000;
-      if(seconds<=0)return this.fail('通過順序が不正です');
-      this.result={type:'success',seconds,start:this.start,end:this.end,flags:[],status:'確定',method:'background-lines-v1'};
-      this.state='計測完了';this.locked=true;this.armed=false;this.quiet=null;return this.result;
-    }
-    return null;
+    this.state='計測中';this.reason='下側判定帯の反応待ち';return null;
   }
 }
 export function csvCell(value){return '"'+String(value??'').replace(/^[=+@\-\t\r]/,"'$&").replaceAll('"','""')+'"';}

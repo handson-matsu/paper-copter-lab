@@ -1,20 +1,9 @@
 import test from 'node:test';import assert from 'node:assert/strict';
-import {MotionDetector,PassageTracker,csvCell} from '../tracker.js';
+import {MotionDetector,BandTimer,bandActivity,csvCell} from '../tracker.js';
 const p=(y,x=.5,area=40)=>({x,y,area,x0:x-.03,x1:x+.03,y0:y-.03,y1:y+.03});
 const d=blobs=>({ready:true,blobs,motion:blobs.length>0});
-function armed(){const tr=new PassageTracker();tr.update(d([]),0);tr.update(d([]),800);return tr;}
-function flight(tr,until=.8){let event;for(let i=0;i<=Math.round((until-.05)/.025);i++)event=tr.update(d([p(.05+i*.025)]),1000+i*50)||event;return event;}
 function image(w=100,h=100,value=30){const a=new Uint8ClampedArray(w*h*4);for(let i=0;i<a.length;i+=4){a[i]=a[i+1]=a[i+2]=value;a[i+3]=255;}return a;}
 function readyDetector(){const m=new MotionDetector(),a=image();for(let t=0;t<=1500;t+=50)m.process(a,100,100,t);assert.ok(m.ready);return m;}
-test('same descending object crosses both lines with interpolated timestamps',()=>{const tr=armed(),result=flight(tr);assert.equal(result.type,'success');assert.ok(Math.abs(result.seconds-1)<1e-9);assert.equal(tr.state,'計測完了');});
-test('irregular frame times determine duration without fixed fps',()=>{const tr=armed();let result;for(const t of [0,40,91,140,211,280,330,401,472,550,622,691,760,830,900,970,1040,1111,1191,1250,1330,1410,1500])result=tr.update(d([p(.05+t*.0005)]),1000+t)||result;assert.ok(Math.abs(result.seconds-1)<1e-9);});
-test('motion beginning below upper line never starts timing',()=>{const tr=armed();for(let i=0;i<15;i++)tr.update(d([p(.4+i*.02)]),1000+i*50);assert.equal(tr.start,null);assert.equal(tr.track,null);});
-test('upper passage without prior continuity fails with no seconds',()=>{const tr=armed();tr.update(d([p(.14)]),1000);const e=tr.update(d([p(.26)]),1100);assert.equal(e.type,'failure');assert.equal(e.seconds,undefined);});
-test('loss fails immediately and unrelated target cannot replace it',()=>{const tr=armed();flight(tr,.4);const e=tr.update(d([]),1800);assert.equal(e.type,'failure');for(let i=0;i<30;i++)assert.equal(tr.update(d([p(.05+i*.025,.8)]),1850+i*50),null);assert.equal(tr.result,null);assert.equal(tr.state,'測定失敗');});
-for(const [name,next] of [['jump',p(.4,.9)],['size change',p(.1,.5,300)],['reverse',p(.01)],['multiple',null]])test(name+' is rejected',()=>{const tr=armed();tr.update(d([p(.08)]),1000);const e=tr.update(d(next?[next]:[p(.1),p(.1,.8)]),1050);assert.equal(e.type,'failure');assert.equal(tr.result,null);});
-test('large processing gap fails',()=>{const tr=armed();tr.update(d([p(.08)]),1000);assert.equal(tr.update(d([p(.12)]),1300).type,'failure');});
-test('stationary local object cannot produce a measurement',()=>{const tr=armed();tr.update(d([p(.08)]),1000);for(let t=1050;t<1800;t+=50)tr.update(d([p(.08)]),t);assert.equal(tr.state,'測定失敗');assert.equal(tr.result,null);});
-test('completion waits for 800ms empty background before next acquisition',()=>{const tr=armed();flight(tr);tr.update(d([p(.8)]),3000);tr.update(d([]),3100);tr.update(d([]),3800);assert.equal(tr.state,'計測完了');tr.update(d([]),3900);assert.equal(tr.state,'待機中');assert.equal(tr.start,null);assert.equal(flight(tr).type,'success');});
 test('background completes despite continual motion using a temporal median',()=>{const m=new MotionDetector();for(let t=0;t<=1500;t+=50)m.process(image(100,100,t%300===0?100:30),100,100,t);assert.equal(m.ready,true);assert.equal(m.samples,15);assert.equal(m.background[0],30);assert.equal(m.captureFrames,null);});
 test('background differences detect any color and remove isolated noise',()=>{for(const rgb of [[220,220,220],[20,200,40],[30,30,230]]){const m=readyDetector(),a=image();for(let y=10;y<20;y++)for(let x=40;x<50;x++)a.set([...rgb,255],(y*100+x)*4);a.set([255,255,255,255],0);const r=m.process(a,100,100,1000);assert.equal(r.blobs.length,1);assert.ok(Math.abs(r.blobs[0].x-.445)<.01);}});
 test('moderate global lighting shift does not create a target',()=>{const m=readyDetector();const r=m.process(image(100,100,55),100,100,1000);assert.equal(r.blobs.length,0);assert.equal(r.invalid,false);});
@@ -22,26 +11,28 @@ test('large lighting changes invalidate a frame',()=>{const m=readyDetector();as
 test('large foreground/camera changes are rejected',()=>{const m=readyDetector(),a=image();for(let y=0;y<50;y++)for(let x=0;x<50;x++)a.set([240,240,240,255],(y*100+x)*4);assert.ok(m.process(a,100,100,1000).invalid);});
 test('same-size frames reuse buffers and background stays frozen',()=>{const m=readyDetector(),b=m.background,q=m.queue;m.process(image(),100,100,1000);assert.equal(m.background,b);assert.equal(m.queue,q);assert.equal(m.background[0],30);m.reset();assert.equal(m.ready,false);});
 test('CSV escapes quotes and formulas',()=>{assert.equal(csvCell('a,"b"\nc'),'"a,""b""\nc"');assert.equal(csvCell('=1+1'),'"\'=1+1"');});
-test('top-edge clipping permits limited area growth only at the image entry',()=>{const tr=armed();tr.update(d([p(.015,.5,16)]),1000);assert.equal(tr.update(d([p(.04,.5,96)]),1050),null);assert.equal(tr.state,'追跡中');});
-test('background completion arms even with residual motion but does not start timing',()=>{const tr=new PassageTracker();tr.update(d([p(.4)]),0);assert.equal(tr.state,'待機中');assert.equal(tr.track,null);assert.equal(tr.armed,true);assert.equal(tr.start,null);});
-test('valid lower passage requires a recorded upper passage',()=>{const tr=armed();tr.update(d([p(.05)]),1000);let e;for(let i=0;i<10;i++)e=tr.update(d([p(.05)]),1050+i*50);assert.equal(tr.start,null);assert.equal(tr.result,null);});
 test('median rejects a moving foreground present in fewer than half of samples',()=>{const m=new MotionDetector();for(let t=0;t<=1500;t+=100){const a=image();if(t<700)a.set([240,240,240,255],(50*100+50)*4);m.process(a,100,100,t);}assert.equal(m.ready,true);assert.equal(m.background[(50*100+50)*3],30);});
 test('waiting background adapts slowly and tracking freezes it',()=>{const m=readyDetector();m.process(image(100,100,40),100,100,1600,50,true);assert.ok(m.background[0]>30&&m.background[0]<31);const v=m.background[0];for(let t=1650;t<2500;t+=50)m.process(image(100,100,45),100,100,t,50,false);assert.equal(m.background[0],v);});
 test('waiting adaptation does not absorb foreground pixels',()=>{const m=readyDetector(),a=image();for(let y=40;y<50;y++)for(let x=40;x<50;x++)a.set([240,240,240,255],(y*100+x)*4);for(let t=1600;t<3000;t+=50)m.process(a,100,100,t,50,true);assert.equal(m.background[(45*100+45)*3],30);});
-test('acquired background remains ready during bad detection without fake failure at idle',()=>{const m=readyDetector(),frame=m.process(image(100,100,200),100,100,1600),tr=armed();tr.update(frame,1600);assert.equal(m.ready,true);assert.equal(tr.state,'待機中');assert.equal(tr.result,null);assert.ok(tr.reason);});
+test('acquired background remains ready during bad detection without fake failure at idle',()=>{const m=readyDetector(),frame=m.process(image(100,100,200),100,100,1600),tr=new BandTimer();tr.update(frame,1600);assert.equal(m.ready,true);assert.equal(tr.state,'待機中');assert.equal(tr.result,null);assert.ok(tr.reason);});
 test('mild pixel noise is below the default difference threshold',()=>{const m=readyDetector(),a=image();for(let p=0;p<10000;p++)a[p*4]+=p%20;assert.equal(m.process(a,100,100,1600).blobs.length,0);});
-for(const [label,side] of [['hand over 8 percent',32],['hand over 16 percent',46]])test(label+' remains visible but cannot become a timed measurement',()=>{
+for(const [label,side] of [['hand over 8 percent',32],['hand over 16 percent',46]])test(label+' remains visible independently of its display candidate exclusion',()=>{
  const m=readyDetector(),a=image();for(let y=20;y<20+side;y++)for(let x=20;x<20+side;x++)a.set([180,140,110,255],(y*100+x)*4);
  const before=m.background[(30*100+30)*3],r=m.process(a,100,100,1600,50,true);
  assert.equal(r.regions.length,1);assert.equal(r.blobs.length,0);assert.equal(r.invalid,true);assert.ok(r.stats.maxDifference>100);assert.ok(r.stats.changedPixels>800);assert.equal(m.background[(30*100+30)*3],before);
- const tr=armed();tr.update(r,1600);assert.equal(tr.track,null);assert.equal(tr.result,null);
+
 });
 test('small component below measurement minimum still has a visible reaction',()=>{
  const m=new MotionDetector(),a=image(320,240);for(let t=0;t<=1500;t+=100)m.process(a,320,240,t);
  for(let y=40;y<43;y++)for(let x=40;x<43;x++)a.set([200,200,200,255],(y*320+x)*4);
  const r=m.process(a,320,240,1600);assert.equal(r.blobs.length,0);assert.equal(r.regions.length,1);assert.equal(r.stats.smallRejected,1);
 });
-test('foreground regions continue being extracted while measurement is locked',()=>{
- const tr=armed();flight(tr);const m=readyDetector(),a=image();for(let y=30;y<45;y++)for(let x=30;x<45;x++)a.set([240,240,240,255],(y*100+x)*4);
- const r=m.process(a,100,100,1700,50,false);tr.update(r,3000);assert.ok(r.regions.length);assert.equal(tr.state,'計測完了');
-});
+const bands=(u=false,l=false,extra={})=>({ready:true,bands:{upper:{active:u},lower:{active:l}},...extra});
+for(const ms of [16.7,33,80,200,500,800])test(`band hits in individual frames measure ${ms}ms`,()=>{const timer=new BandTimer();assert.equal(timer.update(bands(true),1000).type,'start');const e=timer.update(bands(false,true),1000+ms);assert.equal(e.type,'success');assert.ok(Math.abs(e.milliseconds-ms)<1e-8);assert.ok(Math.abs(e.seconds-ms/1000)<1e-8);});
+test('area limits, invalid flag, multiple objects, shape and track loss are not required',()=>{const timer=new BandTimer();timer.update(bands(true,false,{invalid:true,blobs:[],regions:Array(5).fill({area:50000})}),10);timer.update(bands(false,false,{invalid:true}),80);assert.equal(timer.update(bands(false,true,{invalid:true,blobs:[]}),210).seconds,.2);});
+test('lower first never starts, and same timestamp cannot create zero seconds',()=>{const timer=new BandTimer();assert.equal(timer.update(bands(false,true),10),null);assert.equal(timer.start,null);timer.update(bands(true,true),20);assert.equal(timer.update(bands(true,true),20),null);assert.equal(timer.result,null);assert.equal(timer.update(bands(false,true),25).milliseconds,5);});
+test('cooldown is fixed and permits repeated measurements despite remaining motion',()=>{const timer=new BandTimer();timer.update(bands(true),10);timer.update(bands(false,true),210);assert.equal(timer.update(bands(true),809),null);assert.equal(timer.update(bands(true),810).type,'start');assert.equal(timer.update(bands(false,true),1010).milliseconds,200);});
+test('missing lower band times out with reason and no invented result',()=>{const timer=new BandTimer();timer.update(bands(true),100);const e=timer.update(bands(),5101);assert.equal(e.type,'failure');assert.ok(e.reason.includes('下側'));assert.equal(timer.result,null);assert.equal(e.seconds,undefined);});
+test('raw band pixels do not depend on component filtering or entire image ratio',()=>{const mask=new Uint8Array(100*100);mask[25*100+10]=1;mask[25*100+20]=1;mask[25*100+30]=1;const r=bandActivity(mask,100,100);assert.equal(r.upper.active,true);assert.equal(r.upper.pixels,3);assert.equal(r.lower.active,false);});
+test('thick bands detect near-edge hits and exclude motion outside both bands',()=>{const mask=new Uint8Array(10000);for(let x=5;x<9;x++)mask[20*100+x]=1;assert.equal(bandActivity(mask,100,100).upper.active,true);mask.fill(0);for(let x=5;x<9;x++)mask[50*100+x]=1;const r=bandActivity(mask,100,100);assert.equal(r.upper.active,false);assert.equal(r.lower.active,false);});
+test('actual frame timestamps are used without interpolation or fixed fps',()=>{const timer=new BandTimer();timer.update(bands(),7.3);timer.update(bands(true),123.456);timer.update(bands(),141.11);const r=timer.update(bands(false,true),190.789);assert.equal(r.start,123.456);assert.equal(r.end,190.789);assert.ok(Math.abs(r.milliseconds-67.333)<1e-8);});

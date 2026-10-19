@@ -4,7 +4,7 @@ const assert=require('node:assert/strict');const {chromium}=require(process.env.
   const page=await browser.newPage({viewport:{width:1024,height:900},deviceScaleFactor:2}),errors=[];page.on('pageerror',e=>errors.push(e.message));await page.route('https://script.google.com/**',r=>r.abort());await install(page,options);await page.goto(process.env.TEST_URL||'http://localhost:8765/');await page.locator('#debugToggle').check();await prepare(page);
   const before=await page.locator('#debug').textContent();await page.evaluate(()=>{window.boxes=[];window.hand=true;});
   await page.waitForFunction(()=>document.getElementById('debug').textContent.includes('大面積除外=1'));
-  const text=await page.locator('#debug').textContent();assert.match(text,/動体反応: 1 \/ 計測候補: 0/);assert.match(text,/広範囲/);assert.notEqual(text,before);
+  const text=await page.locator('#debug').textContent();assert.match(text,/動体反応: 1 \/ 枠用候補（計測不使用）: 0/);assert.notEqual(text,before);
   await page.waitForFunction(()=>boxes.some(b=>b.color==='#69f2a3'));
   const box=await page.evaluate(()=>boxes.filter(b=>b.color==='#69f2a3').at(-1));
   // Verify object-fit contain mapping against the actual source dimensions.
@@ -13,7 +13,7 @@ const assert=require('node:assert/strict');const {chromium}=require(process.env.
   const left=(geometry.w-geometry.sw*scale)/2,top=(geometry.h-geometry.sh*scale)/2;assert.ok(box.args[0]>=left+.09*geometry.sw*scale&&box.args[0]<=left+.21*geometry.sw*scale);assert.ok(Math.abs(box.args[1]-(top+.32*geometry.sh*scale))<12);
   assert.ok(Math.abs(box.args[2]-.45*geometry.sw*scale)<12);assert.ok(Math.abs(box.args[3]-.5*geometry.sh*scale)<12);
   await page.waitForTimeout(600);const later=await page.locator('#debug').textContent();assert.notEqual(later,text);assert.ok(Number(later.match(/入力変化: (\d+)/)[1])>0);
-  assert.match(await page.locator('#detection').textContent(),/広範囲/);
+  assert.match(await page.locator('#detection').textContent(),/上側|下側/);
   assert.equal(await page.evaluate(()=>JSON.parse(localStorage.getItem('copter.records')||'[]').length),0);
   if(!options.portrait&&!options.fallback)await page.screenshot({path:'/private/tmp/copter-hand-reaction.png',fullPage:true});
   await page.evaluate(()=>window.hand=false);await page.waitForTimeout(100);await page.evaluate(()=>runDrop());await page.waitForFunction(()=>JSON.parse(localStorage.getItem('copter.records')||'[]').length===1,{}, {timeout:10000});

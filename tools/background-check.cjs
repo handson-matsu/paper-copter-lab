@@ -7,7 +7,7 @@ const assert=require('node:assert/strict');const {chromium}=require(process.env.
  assert.ok(await page.locator('#differenceCanvas').isVisible());
  await page.waitForFunction(()=>{const c=document.getElementById('differenceCanvas'),a=c.getContext('2d').getImageData(0,0,c.width,c.height).data;return a.some((v,i)=>i%4===0&&v>50);});
  assert.ok(await page.evaluate(()=>boxes.some(b=>b.color==='#69f2a3')));await page.screenshot({path:'/private/tmp/copter-background-diagnostics.png',fullPage:true});
- await page.evaluate(()=>{window.ambientMotion=false;window.lighting='#dddddd';});await page.waitForTimeout(200);assert.match(await page.locator('#backgroundStatus').textContent(),/取得済み/);assert.equal(await page.locator('#state').textContent(),'待機中');assert.match(await page.locator('#detection').textContent(),/照明変化/);
+ await page.evaluate(()=>{window.ambientMotion=false;window.lighting='#dddddd';});await page.waitForTimeout(200);assert.match(await page.locator('#backgroundStatus').textContent(),/取得済み/);assert.equal(await page.locator('#state').textContent(),'待機中');assert.match(await page.locator('#detection').textContent(),/上側/);
  await page.evaluate(()=>window.lighting='#202020');await page.evaluate(()=>runDrop());await page.waitForFunction(()=>JSON.parse(localStorage.getItem('copter.records')||'[]').length===1,{}, {timeout:10000});assert.equal(await page.locator('#state').textContent(),'計測完了');assert.deepEqual(errors,[]);
  console.log('PASS: moving-background capture completes, residual motion allows idle, difference image/candidates visible, detection failure separate from captured background, normal passage still saved');
 }finally{await browser.close();}})().catch(e=>{console.error(e);process.exit(1);});
