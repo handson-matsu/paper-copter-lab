@@ -27,3 +27,15 @@ export function cameraError(error,phase='capture') {
   const text=phase==='play'?'カメラ映像を再生できません。SafariまたはChromeで直接開き、もう一度起動してください。':messages[name]||'カメラの起動に失敗しました。ブラウザを再起動してお試しください。';
   return `${text}（${name}）`;
 }
+
+// Existing debug display: inspect what Canvas actually delivered, without mutating it.
+export function inspectFrame(data){
+  let hash=2166136261,min=255,max=0,sum=0,alpha=0;
+  for(let i=0;i<data.length;i+=4){
+    const r=data[i],g=data[i+1],b=data[i+2];
+    min=Math.min(min,r,g,b);max=Math.max(max,r,g,b);sum+=r+g+b;alpha+=data[i+3];
+    hash=Math.imul(hash^r,16777619);hash=Math.imul(hash^g,16777619);hash=Math.imul(hash^b,16777619);
+  }
+  const pixels=data.length/4;
+  return {hash:(hash>>>0).toString(16),min,max,mean:pixels?sum/pixels/3:0,alpha:pixels?alpha/pixels:0};
+}

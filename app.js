@@ -1,10 +1,11 @@
 import {MotionDetector,PassageTracker,csvCell} from './tracker.js';
-import {containRect,imagePoint,analysisSize,cameraError} from './camera-utils.js';
+import {containRect,imagePoint,analysisSize,cameraError,inspectFrame} from './camera-utils.js';
 const $=id=>document.getElementById(id),video=$('video'),overlay=$('overlay'),ctx=overlay.getContext('2d');
 const analysis=document.createElement('canvas'),ax=analysis.getContext('2d',{willReadFrequently:true});
 const differenceCanvas=$('differenceCanvas'),differenceContext=differenceCanvas.getContext('2d');let differenceImage=null;
 const detector=new MotionDetector();let tracker=new PassageTracker();
 let stream=null,callback=null,usingVideoFrames=false,sourceWidth=0,sourceHeight=0,lastFrame=0,lastMediaTime=-1,generation=0;
+let frameReads=0,inputInfo=null,lastInputHash=null,inputChanges=0;
 let backgroundRequested=false,upper=.25,lower=.75,dragLine=null,snapshot={},records=[],savedConditions={},fps=0;
 const labels={experiment:'実験名',group:'グループ名',wingLength:'羽根の長さ(mm)',wingWidth:'羽根の幅(mm)',bodyLength:'胴体の長さ(mm)',weights:'重りの数',height:'落下高さ(cm)',memo:'メモ'};
 function warn(text){$('message').textContent=text;}
@@ -27,7 +28,7 @@ function renderRecords(){
 }
 renderRecords();
 $('export').onclick=()=>{const keys=Object.keys(labels),rows=[['測定日時',...Object.values(labels),'時間(秒)','状態','確認理由','開始時刻(ms・ページ基準)','終了時刻(ms・ページ基準)','判定設定','計測方式'],...records.map(r=>[r.date,...keys.map(k=>r.conditions[k]),r.seconds.toFixed(3),r.status,r.flags.join(' / '),r.start,r.end,JSON.stringify(r.config),r.method||'legacy-red-marker'])];const blob=new Blob(['\uFEFF'+rows.map(row=>row.map(csvCell).join(',')).join('\r\n')],{type:'text/csv;charset=utf-8'});const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`paper-copter-${new Date().toISOString().slice(0,10)}.csv`;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);};
-function resetBackground(){detector.reset();backgroundRequested=false;tracker=new PassageTracker({upper,lower});$('backgroundStatus').textContent='背景：未取得';$('captureBackground').disabled=!stream;$('state').textContent='背景未取得';$('time').textContent='—';}
+function resetBackground(){frameReads=0;inputInfo=null;lastInputHash=null;inputChanges=0;detector.reset();backgroundRequested=false;tracker=new PassageTracker({upper,lower});$('backgroundStatus').textContent='背景：未取得';$('captureBackground').disabled=!stream;$('state').textContent='背景未取得';$('time').textContent='—';}
 $('captureBackground').onclick=()=>{
   if(!stream)return;
   detector.reset();tracker=new PassageTracker({upper,lower});backgroundRequested=true;
@@ -70,7 +71,7 @@ function draw(d){
     ctx.fillStyle=color;ctx.font=`${14*scale}px sans-serif`;ctx.fillText(label,r.x+8*scale,r.y+line*r.h-8*scale);
   }
   const box=(p,color,width)=>{ctx.strokeStyle=color;ctx.lineWidth=width*scale;ctx.strokeRect(r.x+p.x0*r.w,r.y+p.y0*r.h,(p.x1-p.x0)*r.w,(p.y1-p.y0)*r.h);};
-  for(const p of d.blobs)box(p,'#69f2a3',1);
+  for(const p of d.regions||d.blobs)box(p,'#69f2a3',1);
   if(tracker.track&&!tracker.locked){const p=tracker.track;box(p,'#63b6ff',3);ctx.beginPath();ctx.arc(r.x+p.x*r.w,r.y+p.y*r.h,8*scale,0,Math.PI*2);ctx.stroke();}
 }
 function drawDiagnostics(d,w,h){
@@ -78,7 +79,7 @@ function drawDiagnostics(d,w,h){
   if(!differenceImage)differenceImage=differenceContext.createImageData(w,h);
   for(let p=0;p<w*h;p++){const v=detector.ready?detector.difference?.[p]||0:0;differenceImage.data[p*4]=v;differenceImage.data[p*4+1]=v;differenceImage.data[p*4+2]=v;differenceImage.data[p*4+3]=255;}
   differenceContext.putImageData(differenceImage,0,0);differenceContext.strokeStyle='#49ff8b';differenceContext.lineWidth=1;
-  for(const b of d.blobs)differenceContext.strokeRect(b.x0*w,b.y0*h,(b.x1-b.x0)*w,(b.y1-b.y0)*h);
+  for(const b of d.regions||d.blobs)differenceContext.strokeRect(b.x0*w,b.y0*h,(b.x1-b.x0)*w,(b.y1-b.y0)*h);
 }
 function frame(t,token){
   if(token!==generation||!stream)return;
@@ -90,7 +91,11 @@ function frame(t,token){
       lastMediaTime=video.currentTime;fps=lastFrame?1000/(t-lastFrame):0;lastFrame=t;const begin=performance.now();
       const {width:w,height:h}=analysisSize(video.videoWidth,video.videoHeight);if(analysis.width!==w||analysis.height!==h){analysis.width=w;analysis.height=h;}
       let d={ready:false,blobs:[],motion:false,reason:'静止背景を取得してください'};
-      if(backgroundRequested){ax.drawImage(video,0,0,w,h);d=detector.process(ax.getImageData(0,0,w,h).data,w,h,t,Number($('sensitivity').value),!tracker.track&&!tracker.locked);}
+      if(backgroundRequested){
+        ax.drawImage(video,0,0,w,h);const pixels=ax.getImageData(0,0,w,h).data;frameReads++;
+        if($('debugToggle').checked){inputInfo=inspectFrame(pixels);if(lastInputHash!==null&&inputInfo.hash!==lastInputHash)inputChanges++;lastInputHash=inputInfo.hash;}
+        d=detector.process(pixels,w,h,t,Number($('sensitivity').value),!tracker.track&&!tracker.locked);
+      }
       $('backgroundStatus').textContent=!backgroundRequested?'背景：未取得':detector.ready?`背景：取得済み（${detector.samples}フレーム中央値）`:`背景：取得中 ${Math.round((d.progress||0)*100)}%`;
       const priorState=tracker.state,hadTrack=!!tracker.track,event=backgroundRequested?tracker.update(d,t):null;
       if(priorState!==tracker.state){
@@ -101,10 +106,10 @@ function frame(t,token){
       if(event?.type==='success')saveResult(event);
       if(event?.type==='failure'){$('time').textContent='—';$('resultNotice').textContent=event.reason+'。数値は保存しません。';}
       $('state').textContent=backgroundRequested?tracker.state:'背景未取得';
-      $('detection').textContent=tracker.locked?(tracker.reason?tracker.reason+'。動きが収まるのを待っています':'動きが収まるのを待っています'):d.reason||(!tracker.armed?'画面の静止を確認しています':'')||tracker.reason||`${d.blobs.length}個の動体候補`;
+      $('detection').textContent=tracker.locked?(tracker.reason?tracker.reason+'。動きが収まるのを待っています':'動きが収まるのを待っています'):d.reason||(!tracker.armed?'画面の静止を確認しています':'')||`${(d.regions||d.blobs).length}個の動体反応 / 計測候補${d.blobs.length}個`;
       if(tracker.start!==null&&!tracker.locked)$('time').textContent=((t-tracker.start)/1000).toFixed(3);
       draw(d);
-      if($('debugToggle').checked){drawDiagnostics(d,w,h);$('debug').textContent=`背景: ${detector.ready?'取得済み':'未取得'} / 候補: ${d.blobs.length}\n対象: ${tracker.track?`${tracker.track.x.toFixed(3)}, ${tracker.track.y.toFixed(3)} / ${tracker.track.area}px`:'—'}\n縦速度: ${tracker.speed.toFixed(3)} 画面高/秒\n上側通過: ${tracker.start??'—'} ms / 下側通過: ${tracker.end??'—'} ms\n処理: ${fps.toFixed(1)} fps / ${(performance.now()-begin).toFixed(2)} ms / ${w}×${h}\n理由: ${tracker.reason||d.reason||'なし'}`;}
+      if($('debugToggle').checked){drawDiagnostics(d,w,h);$('debug').textContent=`背景: ${detector.ready?'取得済み':'未取得'} / 動体反応: ${(d.regions||d.blobs).length} / 計測候補: ${d.blobs.length}\nCanvas取得: ${frameReads}回 / 入力変化: ${inputChanges}回 / video時刻: ${video.currentTime.toFixed(3)}s\n入力: hash=${inputInfo?.hash||'—'} RGB=${inputInfo?.min??'—'}..${inputInfo?.max??'—'} 平均=${inputInfo?.mean.toFixed(1)??'—'} α=${inputInfo?.alpha.toFixed(0)??'—'}\n差分: 補正前最大=${d.stats?.rawMaxDifference.toFixed(1)??'—'} 補正後最大=${d.stats?.maxDifference.toFixed(1)??'—'} 閾値=${d.stats?.threshold??'—'}\n変化画素: ${d.stats?.changedPixels??'—'} / 小面積除外=${d.stats?.smallRejected??'—'} 大面積除外=${d.stats?.largeRejected??'—'}\n背景更新: ${d.stats?.backgroundUpdating?'待機中の非前景画素のみ':'停止'} / 解析時刻: ${t.toFixed(1)}ms\n対象: ${tracker.track?`${tracker.track.x.toFixed(3)}, ${tracker.track.y.toFixed(3)} / ${tracker.track.area}px`:'—'}\n縦速度: ${tracker.speed.toFixed(3)} 画面高/秒\n上側通過: ${tracker.start??'—'} ms / 下側通過: ${tracker.end??'—'} ms\n処理: ${fps.toFixed(1)} fps / ${(performance.now()-begin).toFixed(2)} ms / ${w}×${h}\n理由: ${d.reason||tracker.reason||'なし'}`;}
     }
   }catch(e){stopCamera(`解析を継続できません（${e.name}）。再起動してください。`);return;}
   schedule(token);

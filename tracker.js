@@ -38,9 +38,10 @@ export class MotionDetector {
     const offsets=[];
     for(let c=0;c<3;c++){let sum=0;for(let i=0;i<511;i++){sum+=this.hist[c*511+i];if(sum>=count/2){offsets[c]=i-255;break;}}}
     this.mask.fill(0);this.clean.fill(0);this.seen.fill(0);
-    let changed=0;
+    let changed=0,maxDifference=0,rawMaxDifference=0;
     for(let p=0;p<n;p++){
-      let diff=0;for(let c=0;c<3;c++)diff=Math.max(diff,Math.abs(data[p*4+c]-this.background[p*3+c]-offsets[c]));
+      let diff=0;for(let c=0;c<3;c++){const raw=data[p*4+c]-this.background[p*3+c];rawMaxDifference=Math.max(rawMaxDifference,Math.abs(raw));diff=Math.max(diff,Math.abs(raw-offsets[c]));}
+      maxDifference=Math.max(maxDifference,diff);
       this.difference[p]=Math.min(255,diff);
       if(diff>threshold){this.mask[p]=1;changed++;}
     }
@@ -52,9 +53,10 @@ export class MotionDetector {
         const i=p*3+c;this.background[i]+=alpha*(data[p*4+c]-this.background[i]);
       }
     }
-    if(changed/n>.16 || offsets.some(v=>Math.abs(v)>80))return {ready:true,blobs:[],motion:true,invalid:true,reason:'照明変化／カメラ移動が大きすぎます。背景を再取得してください'};
+    const widespread=changed/n>.16 || offsets.some(v=>Math.abs(v)>80);
+    // A measurement rejection must not hide the detected foreground on screen.
     for(let y=1;y<h-1;y++)for(let x=1;x<w-1;x++){const p=y*w+x;if(this.mask[p]&&(this.mask[p-1]+this.mask[p+1]+this.mask[p-w]+this.mask[p+w]>=2))this.clean[p]=1;}
-    const blobs=[];let motionPixels=0;
+    const blobs=[],regions=[];let motionPixels=0,components=0,smallRejected=0,largeRejected=0;
     for(let p=0;p<n;p++){
       if(!this.clean[p]||this.seen[p])continue;
       this.queue[0]=p;this.seen[p]=1;let length=1,sx=0,sy=0,x0=w,y0=h,x1=0,y1=0;
@@ -65,12 +67,18 @@ export class MotionDetector {
         if(y>0&&this.clean[i-w]&&!this.seen[i-w]){this.seen[i-w]=1;this.queue[length++]=i-w;}
         if(y<h-1&&this.clean[i+w]&&!this.seen[i+w]){this.seen[i+w]=1;this.queue[length++]=i+w;}
       }
-      if(length>=Math.max(9,n*.00015)){
-        motionPixels+=length;
-        if(length<n*.08)blobs.push({x:sx/length/w,y:sy/length/h,area:length,x0:x0/w,y0:y0/h,x1:(x1+1)/w,y1:(y1+1)/h});
-      }
+      components++;
+      const region={x:sx/length/w,y:sy/length/h,area:length,x0:x0/w,y0:y0/h,x1:(x1+1)/w,y1:(y1+1)/h};
+      if(length>=3)regions.push(region);
+      if(length<Math.max(9,n*.00015)){smallRejected++;continue;}
+      motionPixels+=length;
+      if(length>=n*.08){largeRejected++;continue;}
+      blobs.push(region);
     }
-    return {ready:true,blobs,motion:motionPixels>0,invalid:motionPixels>0&&!blobs.length,reason:motionPixels&&!blobs.length?'物体が大きすぎます':''};
+    const invalid=widespread || (motionPixels>0&&!blobs.length);
+    const reason=widespread?'広範囲の動体反応／照明変化：計測対象から除外':largeRejected?'大きな動体反応：計測対象から除外':smallRejected&&!blobs.length?'小さい動体反応：計測面積条件未満':'';
+    return {ready:true,blobs,regions,motion:motionPixels>0||widespread,invalid,reason,
+      stats:{threshold,rawMaxDifference,maxDifference,changedPixels:changed,changedRatio:changed/n,components,smallRejected,largeRejected,offsets,backgroundUpdating:adapt&&changed/n<=.16&&offsets.every(v=>Math.abs(v)<=80)}};
   }
 }
 export class PassageTracker {

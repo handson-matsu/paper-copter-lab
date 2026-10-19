@@ -30,3 +30,18 @@ test('waiting background adapts slowly and tracking freezes it',()=>{const m=rea
 test('waiting adaptation does not absorb foreground pixels',()=>{const m=readyDetector(),a=image();for(let y=40;y<50;y++)for(let x=40;x<50;x++)a.set([240,240,240,255],(y*100+x)*4);for(let t=1600;t<3000;t+=50)m.process(a,100,100,t,50,true);assert.equal(m.background[(45*100+45)*3],30);});
 test('acquired background remains ready during bad detection without fake failure at idle',()=>{const m=readyDetector(),frame=m.process(image(100,100,200),100,100,1600),tr=armed();tr.update(frame,1600);assert.equal(m.ready,true);assert.equal(tr.state,'待機中');assert.equal(tr.result,null);assert.ok(tr.reason);});
 test('mild pixel noise is below the default difference threshold',()=>{const m=readyDetector(),a=image();for(let p=0;p<10000;p++)a[p*4]+=p%20;assert.equal(m.process(a,100,100,1600).blobs.length,0);});
+for(const [label,side] of [['hand over 8 percent',32],['hand over 16 percent',46]])test(label+' remains visible but cannot become a timed measurement',()=>{
+ const m=readyDetector(),a=image();for(let y=20;y<20+side;y++)for(let x=20;x<20+side;x++)a.set([180,140,110,255],(y*100+x)*4);
+ const before=m.background[(30*100+30)*3],r=m.process(a,100,100,1600,50,true);
+ assert.equal(r.regions.length,1);assert.equal(r.blobs.length,0);assert.equal(r.invalid,true);assert.ok(r.stats.maxDifference>100);assert.ok(r.stats.changedPixels>800);assert.equal(m.background[(30*100+30)*3],before);
+ const tr=armed();tr.update(r,1600);assert.equal(tr.track,null);assert.equal(tr.result,null);
+});
+test('small component below measurement minimum still has a visible reaction',()=>{
+ const m=new MotionDetector(),a=image(320,240);for(let t=0;t<=1500;t+=100)m.process(a,320,240,t);
+ for(let y=40;y<43;y++)for(let x=40;x<43;x++)a.set([200,200,200,255],(y*320+x)*4);
+ const r=m.process(a,320,240,1600);assert.equal(r.blobs.length,0);assert.equal(r.regions.length,1);assert.equal(r.stats.smallRejected,1);
+});
+test('foreground regions continue being extracted while measurement is locked',()=>{
+ const tr=armed();flight(tr);const m=readyDetector(),a=image();for(let y=30;y<45;y++)for(let x=30;x<45;x++)a.set([240,240,240,255],(y*100+x)*4);
+ const r=m.process(a,100,100,1700,50,false);tr.update(r,3000);assert.ok(r.regions.length);assert.equal(tr.state,'計測完了');
+});

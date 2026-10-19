@@ -31,3 +31,7 @@ test('camera failures include diagnostic name and playback has separate advice',
   for(const name of ['NotAllowedError','NotFoundError','NotReadableError','OverconstrainedError','SecurityError','AbortError','InvalidStateError','OtherError'])assert.ok(cameraError({name}).includes(name));
   assert.ok(cameraError({name:'NotAllowedError'},'play').includes('再生できません'));
 });
+test('Canvas diagnostic fingerprint distinguishes changed RGB frames and reports transparency',async()=>{
+  const {inspectFrame}=await import('../camera-utils.js');const a=new Uint8ClampedArray([30,30,30,255,30,30,30,255]);
+  const first=inspectFrame(a);a[0]=180;const next=inspectFrame(a);assert.notEqual(first.hash,next.hash);assert.equal(next.max,180);assert.equal(next.alpha,255);assert.equal(inspectFrame(new Uint8ClampedArray(8)).alpha,0);
+});
