@@ -1,24 +1,36 @@
 // Background and tracking buffers contain only reduced-resolution local pixels.
 export class MotionDetector {
   constructor(){this.reset();}
-  reset(){this.ready=false;this.started=null;this.samples=0;this.width=0;this.height=0;}
+  reset(){this.ready=false;this.started=null;this.samples=0;this.width=0;this.height=0;this.lastAdapt=null;this.captureFrames=null;}
   allocate(w,h){
     if(this.width===w&&this.height===h)return;
     this.reset();this.width=w;this.height=h;const n=w*h;
-    this.background=new Float32Array(n*3);this.previous=new Uint8Array(n*3);
+    this.background=new Float32Array(n*3);this.captureFrames=new Uint8Array(n*3*15);this.difference=new Uint8Array(n);
     this.mask=new Uint8Array(n);this.clean=new Uint8Array(n);this.seen=new Uint8Array(n);this.queue=new Uint32Array(n);
     this.hist=new Uint32Array(511*3);
   }
-  process(data,w,h,t,sensitivity=50){
-    this.allocate(w,h);const n=w*h,threshold=42-sensitivity*.28;
+  process(data,w,h,t,sensitivity=50,adapt=false){
+    this.allocate(w,h);const n=w*h,threshold=50-sensitivity*.28;
     if(!this.ready){
-      let changed=0;
-      for(let p=0;p<n;p++){let d=0;for(let c=0;c<3;c++){const value=data[p*4+c];d+=Math.abs(value-this.previous[p*3+c]);this.previous[p*3+c]=value;}if(d>48)changed++;}
-      if(this.started===null || (this.samples && changed/n>.005)){this.started=t;this.samples=0;}
-      this.samples++;
-      for(let p=0;p<n;p++)for(let c=0;c<3;c++){const i=p*3+c;this.background[i]+=(data[p*4+c]-this.background[i])/this.samples;}
-      this.ready=t-this.started>=800&&this.samples>=10;
-      return {ready:this.ready,blobs:[],motion:false,reason:this.ready?'背景取得完了':'背景取得中：画面を静止してください'};
+      if(this.started===null)this.started=t;
+      if(this.samples<15 && t-this.started>=this.samples*100){
+        const offset=this.samples*n*3;
+        for(let p=0;p<n;p++)for(let c=0;c<3;c++)this.captureFrames[offset+p*3+c]=data[p*4+c];
+        this.samples++;
+      }
+      if(t-this.started>=1500 && this.samples>=3){
+        const scratch=new Uint8Array(this.samples);
+        for(let i=0;i<n*3;i++){
+          for(let k=0;k<this.samples;k++){
+            const value=this.captureFrames[k*n*3+i];let j=k;
+            while(j>0&&scratch[j-1]>value){scratch[j]=scratch[j-1];j--;}
+            scratch[j]=value;
+          }
+          this.background[i]=this.samples%2?scratch[Math.floor(this.samples/2)]:(scratch[this.samples/2-1]+scratch[this.samples/2])/2;
+        }
+        this.ready=true;this.captureFrames=null;this.lastAdapt=t;
+      }
+      return {ready:this.ready,blobs:[],motion:false,progress:Math.min(1,(t-this.started)/1500),reason:this.ready?`背景取得完了（${this.samples}フレーム中央値）`:'背景取得中：多少の動きがあっても約1.5秒で完了します'};
     }
     // Sampled channel-wise median compensates a global illumination shift.
     this.hist.fill(0);let count=0;
@@ -29,9 +41,18 @@ export class MotionDetector {
     let changed=0;
     for(let p=0;p<n;p++){
       let diff=0;for(let c=0;c<3;c++)diff=Math.max(diff,Math.abs(data[p*4+c]-this.background[p*3+c]-offsets[c]));
+      this.difference[p]=Math.min(255,diff);
       if(diff>threshold){this.mask[p]=1;changed++;}
     }
-    if(changed/n>.16 || offsets.some(v=>Math.abs(v)>55))return {ready:true,blobs:[],motion:true,invalid:true,reason:'照明変化／カメラ移動が大きすぎます。背景を再取得してください'};
+    const dt=this.lastAdapt===null?0:Math.max(0,Math.min(200,t-this.lastAdapt));this.lastAdapt=t;
+    // Freeze during tracking/cooldown. Never learn foreground pixels into the model.
+    if(adapt && changed/n<=.16 && offsets.every(v=>Math.abs(v)<=80)){
+      const alpha=1-Math.exp(-dt/15000);
+      for(let p=0;p<n;p++)if(!this.mask[p])for(let c=0;c<3;c++){
+        const i=p*3+c;this.background[i]+=alpha*(data[p*4+c]-this.background[i]);
+      }
+    }
+    if(changed/n>.16 || offsets.some(v=>Math.abs(v)>80))return {ready:true,blobs:[],motion:true,invalid:true,reason:'照明変化／カメラ移動が大きすぎます。背景を再取得してください'};
     for(let y=1;y<h-1;y++)for(let x=1;x<w-1;x++){const p=y*w+x;if(this.mask[p]&&(this.mask[p-1]+this.mask[p+1]+this.mask[p-w]+this.mask[p+w]>=2))this.clean[p]=1;}
     const blobs=[];let motionPixels=0;
     for(let p=0;p<n;p++){
@@ -54,17 +75,18 @@ export class MotionDetector {
 }
 export class PassageTracker {
   constructor(config={}){this.config={upper:.25,lower:.75,quietMs:800,maxMs:10000,maxGap:180,...config};this.reset();}
-  reset(){this.state='静止待ち';this.track=null;this.start=null;this.end=null;this.reason='';this.quiet=null;this.locked=false;this.armed=false;this.result=null;this.speed=0;}
+  reset(){this.state='背景取得待ち';this.track=null;this.start=null;this.end=null;this.reason='';this.quiet=null;this.locked=false;this.armed=false;this.result=null;this.speed=0;}
   fail(reason){if(this.locked)return null;this.reason=reason;this.state='測定失敗';this.locked=true;this.armed=false;this.quiet=null;this.track=null;return {type:'failure',reason};}
   update(d,t){
     if(!d.ready){this.state='背景取得中';return null;}
-    if(this.locked||!this.armed){
+    if(!this.armed&&!this.locked){this.armed=true;this.state='待機中';return null;}
+    if(this.locked){
       if(!this.locked)this.state='静止待ち';
       if(d.motion||d.invalid)this.quiet=null;else if(this.quiet===null)this.quiet=t;
       if(this.quiet!==null&&t-this.quiet>=this.config.quietMs){this.locked=false;this.armed=true;this.track=null;this.start=null;this.end=null;this.state='待機中';this.result=null;this.speed=0;}
       return null;
     }
-    if(d.invalid)return this.fail(d.reason||'背景変動');
+    if(d.invalid){if(this.track)return this.fail(d.reason||'背景変動');this.reason=d.reason||'背景変動';this.state='待機中';return null;}
     if(!this.track){
       if(d.blobs.length!==1)return null;
       const p=d.blobs[0];

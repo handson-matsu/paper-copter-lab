@@ -16,6 +16,7 @@ exports.install=async function(page,options={}){
       const cx=c.getContext('2d');
       const draw=()=>{
         cx.fillStyle=window.lighting||'#202020';cx.fillRect(0,0,c.width,c.height);
+        if(window.ambientMotion){cx.fillStyle='#aaaaaa';cx.fillRect((.5+.3*Math.sin(performance.now()/50))*c.width,.6*c.height,40,40);}
         if(window.drop){const age=(performance.now()-drop.start)/1000;
           let y=-.04+age*.5;
           if(drop.mode==='below')y=.4+age*.5;

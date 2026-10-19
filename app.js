@@ -2,6 +2,7 @@ import {MotionDetector,PassageTracker,csvCell} from './tracker.js';
 import {containRect,imagePoint,analysisSize,cameraError} from './camera-utils.js';
 const $=id=>document.getElementById(id),video=$('video'),overlay=$('overlay'),ctx=overlay.getContext('2d');
 const analysis=document.createElement('canvas'),ax=analysis.getContext('2d',{willReadFrequently:true});
+const differenceCanvas=$('differenceCanvas'),differenceContext=differenceCanvas.getContext('2d');let differenceImage=null;
 const detector=new MotionDetector();let tracker=new PassageTracker();
 let stream=null,callback=null,usingVideoFrames=false,sourceWidth=0,sourceHeight=0,lastFrame=0,lastMediaTime=-1,generation=0;
 let backgroundRequested=false,upper=.25,lower=.75,dragLine=null,snapshot={},records=[],savedConditions={},fps=0;
@@ -26,11 +27,11 @@ function renderRecords(){
 }
 renderRecords();
 $('export').onclick=()=>{const keys=Object.keys(labels),rows=[['測定日時',...Object.values(labels),'時間(秒)','状態','確認理由','開始時刻(ms・ページ基準)','終了時刻(ms・ページ基準)','判定設定','計測方式'],...records.map(r=>[r.date,...keys.map(k=>r.conditions[k]),r.seconds.toFixed(3),r.status,r.flags.join(' / '),r.start,r.end,JSON.stringify(r.config),r.method||'legacy-red-marker'])];const blob=new Blob(['\uFEFF'+rows.map(row=>row.map(csvCell).join(',')).join('\r\n')],{type:'text/csv;charset=utf-8'});const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`paper-copter-${new Date().toISOString().slice(0,10)}.csv`;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);};
-function resetBackground(){detector.reset();backgroundRequested=false;tracker=new PassageTracker({upper,lower});$('captureBackground').disabled=!stream;$('state').textContent='背景未取得';$('time').textContent='—';}
+function resetBackground(){detector.reset();backgroundRequested=false;tracker=new PassageTracker({upper,lower});$('backgroundStatus').textContent='背景：未取得';$('captureBackground').disabled=!stream;$('state').textContent='背景未取得';$('time').textContent='—';}
 $('captureBackground').onclick=()=>{
   if(!stream)return;
   detector.reset();tracker=new PassageTracker({upper,lower});backgroundRequested=true;
-  $('time').textContent='—';$('resultNotice').textContent='';warn('何も落とさず、背景だけを約1秒静止させてください。');
+  $('time').textContent='—';$('resultNotice').textContent='';warn('背景を約1.5秒撮影します。多少の動きがあっても取得します。');
 };
 function changedSettings(){
   if(tracker.track&&!tracker.locked){tracker.fail('ライン・感度の変更で中断');$('time').textContent='—';$('resultNotice').textContent='設定変更で測定失敗。数値は保存しません。';}
@@ -43,7 +44,7 @@ function setLine(which,y){if(which==='upper')upper=Math.max(.10,Math.min(lower-.
 $('upperLine').oninput=e=>setLine('upper',Number(e.target.value)/100);
 $('lowerLine').oninput=e=>setLine('lower',Number(e.target.value)/100);
 $('sensitivity').oninput=()=>{$('sensitivityValue').textContent=$('sensitivity').value;changedSettings();};
-$('debugToggle').onchange=()=>{$('debug').hidden=!$('debugToggle').checked;};
+$('debugToggle').onchange=()=>{$('debug').hidden=!$('debugToggle').checked;$('diagnostics').hidden=!$('debugToggle').checked;};
 function videoRect(){return containRect(overlay.width,overlay.height,video.videoWidth,video.videoHeight);}
 function pointerPoint(e){const b=overlay.getBoundingClientRect();return imagePoint(videoRect(),(e.clientX-b.left)*overlay.width/b.width,(e.clientY-b.top)*overlay.height/b.height);}
 overlay.onpointerdown=e=>{
@@ -57,7 +58,7 @@ overlay.onpointerup=overlay.onpointercancel=()=>{dragLine=null;};
 function resize(){const b=overlay.getBoundingClientRect();if(!b.width||!b.height)return;const scale=Math.min(devicePixelRatio||1,2,1920/Math.max(b.width,b.height));const w=Math.round(b.width*scale),h=Math.round(b.height*scale);if(overlay.width!==w||overlay.height!==h){overlay.width=w;overlay.height=h;}}
 new ResizeObserver(resize).observe($('stage'));
 function saveResult(result){
-  const record={...result,id:crypto.randomUUID(),date:new Date().toISOString(),conditions:{...snapshot},config:{...tracker.config,sensitivity:Number($('sensitivity').value)}};
+  const record={...result,id:crypto.randomUUID(),date:new Date().toISOString(),conditions:{...snapshot},config:{...tracker.config,sensitivity:Number($('sensitivity').value),backgroundModel:'median-1500ms-idle-adaptive',backgroundSamples:detector.samples}};
   records.unshift(record);const ok=store('copter.records',records);renderRecords();
   $('time').textContent=result.seconds.toFixed(3);$('resultNotice').textContent=ok?'ライン間通過時間を自動保存しました。':'保存失敗：CSVを書き出してください。';
 }
@@ -72,6 +73,13 @@ function draw(d){
   for(const p of d.blobs)box(p,'#69f2a3',1);
   if(tracker.track&&!tracker.locked){const p=tracker.track;box(p,'#63b6ff',3);ctx.beginPath();ctx.arc(r.x+p.x*r.w,r.y+p.y*r.h,8*scale,0,Math.PI*2);ctx.stroke();}
 }
+function drawDiagnostics(d,w,h){
+  if(differenceCanvas.width!==w||differenceCanvas.height!==h){differenceCanvas.width=w;differenceCanvas.height=h;differenceImage=differenceContext.createImageData(w,h);}
+  if(!differenceImage)differenceImage=differenceContext.createImageData(w,h);
+  for(let p=0;p<w*h;p++){const v=detector.ready?detector.difference?.[p]||0:0;differenceImage.data[p*4]=v;differenceImage.data[p*4+1]=v;differenceImage.data[p*4+2]=v;differenceImage.data[p*4+3]=255;}
+  differenceContext.putImageData(differenceImage,0,0);differenceContext.strokeStyle='#49ff8b';differenceContext.lineWidth=1;
+  for(const b of d.blobs)differenceContext.strokeRect(b.x0*w,b.y0*h,(b.x1-b.x0)*w,(b.y1-b.y0)*h);
+}
 function frame(t,token){
   if(token!==generation||!stream)return;
   try{
@@ -82,10 +90,11 @@ function frame(t,token){
       lastMediaTime=video.currentTime;fps=lastFrame?1000/(t-lastFrame):0;lastFrame=t;const begin=performance.now();
       const {width:w,height:h}=analysisSize(video.videoWidth,video.videoHeight);if(analysis.width!==w||analysis.height!==h){analysis.width=w;analysis.height=h;}
       let d={ready:false,blobs:[],motion:false,reason:'静止背景を取得してください'};
-      if(backgroundRequested){ax.drawImage(video,0,0,w,h);d=detector.process(ax.getImageData(0,0,w,h).data,w,h,t,Number($('sensitivity').value));}
+      if(backgroundRequested){ax.drawImage(video,0,0,w,h);d=detector.process(ax.getImageData(0,0,w,h).data,w,h,t,Number($('sensitivity').value),!tracker.track&&!tracker.locked);}
+      $('backgroundStatus').textContent=!backgroundRequested?'背景：未取得':detector.ready?`背景：取得済み（${detector.samples}フレーム中央値）`:`背景：取得中 ${Math.round((d.progress||0)*100)}%`;
       const priorState=tracker.state,hadTrack=!!tracker.track,event=backgroundRequested?tracker.update(d,t):null;
       if(priorState!==tracker.state){
-        const messages={'待機中':'準備完了。紙コプターを撮影範囲より上から落としてください。','追跡中':'同じ物体を追跡中。上下ラインの下向き通過を確認します。','静止待ち':'画面が静止するのを待っています。','背景取得中':'空の背景だけを静止させてください。','計測完了':'計測完了。画面内の物体を片づけると次を受け付けます。','測定失敗':tracker.reason+'。数値は保存しません。画面内を空にしてください。'};
+        const messages={'待機中':'準備完了。紙コプターを撮影範囲より上から落としてください。','追跡中':'同じ物体を追跡中。上下ラインの下向き通過を確認します。','静止待ち':'画面が静止するのを待っています。','背景取得中':'背景を約1.5秒撮影中。多少の動きがあっても取得します。','計測完了':'計測完了。画面内の物体を片づけると次を受け付けます。','測定失敗':tracker.reason+'。数値は保存しません。画面内を空にしてください。'};
         if(messages[tracker.state])warn(messages[tracker.state]);
       }
       if(!hadTrack&&tracker.track){snapshot=conditions();$('time').textContent='—';$('resultNotice').textContent='';}
@@ -95,7 +104,7 @@ function frame(t,token){
       $('detection').textContent=tracker.locked?(tracker.reason?tracker.reason+'。動きが収まるのを待っています':'動きが収まるのを待っています'):d.reason||(!tracker.armed?'画面の静止を確認しています':'')||tracker.reason||`${d.blobs.length}個の動体候補`;
       if(tracker.start!==null&&!tracker.locked)$('time').textContent=((t-tracker.start)/1000).toFixed(3);
       draw(d);
-      if($('debugToggle').checked)$('debug').textContent=`背景: ${detector.ready?'取得済み':'未取得'} / 候補: ${d.blobs.length}\n対象: ${tracker.track?`${tracker.track.x.toFixed(3)}, ${tracker.track.y.toFixed(3)} / ${tracker.track.area}px`:'—'}\n縦速度: ${tracker.speed.toFixed(3)} 画面高/秒\n上側通過: ${tracker.start??'—'} ms / 下側通過: ${tracker.end??'—'} ms\n処理: ${fps.toFixed(1)} fps / ${(performance.now()-begin).toFixed(2)} ms / ${w}×${h}\n理由: ${tracker.reason||d.reason||'なし'}`;
+      if($('debugToggle').checked){drawDiagnostics(d,w,h);$('debug').textContent=`背景: ${detector.ready?'取得済み':'未取得'} / 候補: ${d.blobs.length}\n対象: ${tracker.track?`${tracker.track.x.toFixed(3)}, ${tracker.track.y.toFixed(3)} / ${tracker.track.area}px`:'—'}\n縦速度: ${tracker.speed.toFixed(3)} 画面高/秒\n上側通過: ${tracker.start??'—'} ms / 下側通過: ${tracker.end??'—'} ms\n処理: ${fps.toFixed(1)} fps / ${(performance.now()-begin).toFixed(2)} ms / ${w}×${h}\n理由: ${tracker.reason||d.reason||'なし'}`;}
     }
   }catch(e){stopCamera(`解析を継続できません（${e.name}）。再起動してください。`);return;}
   schedule(token);
@@ -111,7 +120,7 @@ $('startCamera').onclick=async()=>{
   if(!window.isSecureContext){warn('カメラにはHTTPSが必要です。GitHub PagesのHTTPS URL、またはlocalhostで開いてください。');return;}
   if(!navigator.mediaDevices?.getUserMedia){warn('このブラウザではカメラAPIを利用できません。SafariまたはChromeで直接開いてください。');return;}
   resetBackground();$('startCamera').disabled=true;$('stopCamera').disabled=false;warn('カメラの許可・起動を待っています。取り消す場合は停止を押してください。');const token=++generation;let phase='capture';
-  try{const media=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:1280},height:{ideal:720},frameRate:{ideal:30,max:30}},audio:false});if(token!==generation){media.getTracks().forEach(t=>t.stop());return;}stream=media;video.muted=true;video.playsInline=true;video.srcObject=stream;phase='play';await video.play();if(token!==generation)return;sourceWidth=video.videoWidth;sourceHeight=video.videoHeight;if(!sourceWidth||!sourceHeight)throw new DOMException('映像サイズが取得できません','NotReadableError');resetBackground();resize();lastFrame=0;lastMediaTime=-1;$('placeholder').hidden=true;$('stopCamera').disabled=false;$('cameraState').textContent='● CAMERA LIVE';stream.getVideoTracks()[0].onended=()=>stopCamera('カメラ接続が終了しました。もう一度起動してください。');$('captureBackground').disabled=false;warn('空の静止背景を取得し、撮影範囲の上から落としてください。');schedule(token);}
+  try{const media=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:1280},height:{ideal:720},frameRate:{ideal:30,max:30}},audio:false});if(token!==generation){media.getTracks().forEach(t=>t.stop());return;}stream=media;video.muted=true;video.playsInline=true;video.srcObject=stream;phase='play';await video.play();if(token!==generation)return;sourceWidth=video.videoWidth;sourceHeight=video.videoHeight;if(!sourceWidth||!sourceHeight)throw new DOMException('映像サイズが取得できません','NotReadableError');resetBackground();resize();lastFrame=0;lastMediaTime=-1;$('placeholder').hidden=true;$('stopCamera').disabled=false;$('cameraState').textContent='● CAMERA LIVE';stream.getVideoTracks()[0].onended=()=>stopCamera('カメラ接続が終了しました。もう一度起動してください。');$('captureBackground').disabled=false;warn('約1.5秒で背景を取得し、撮影範囲の上から落としてください。');schedule(token);}
   catch(e){if(token!==generation)return;stopCamera(cameraError(e,phase));}
 };
 document.addEventListener('visibilitychange',()=>{if(document.hidden)stopCamera('画面が非表示になったためカメラを停止しました。戻ったら起動してください。');});
